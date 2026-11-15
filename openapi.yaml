@@ -1,0 +1,617 @@
+openapi: 3.0.3
+info:
+  title: Billing API
+  version: 0.1.0
+  description: |
+    Multi-tenant billing API for ecommerce stores: invoices with automatic numbering and PDF output,
+    configurable tax (including Indian GST with HSN codes), discounts, coupons, credit notes,
+    full and partial refunds, multi-currency, and signed webhooks.
+
+    **Amounts** are integers in the currency's minor unit (`118000` = INR 1,180.00, `1500` = JPY 1,500).
+
+    **Auth**: every merchant has its own API key, sent as `Authorization: Bearer <key>`. A key only
+    ever sees its own merchant's data. Onboarding a merchant uses the platform `X-Admin-Token`.
+
+    **Idempotency**: pass `external_id` (your order or refund id) when creating invoices and refunds.
+    Repeating the request returns the original resource with status `200` instead of creating a duplicate.
+
+    **Webhooks**: events `invoice.created`, `invoice.paid`, `refund.issued` are POSTed as JSON with header
+    `X-Billing-Signature: t=<unix>,v1=<hex>` where `v1 = HMAC_SHA256(secret, "<t>.<raw body>")`.
+    Non-2xx responses are retried up to 6 times with backoff.
+servers:
+  - url: http://localhost:3000
+security:
+  - ApiKey: []
+tags:
+  - name: Merchants
+  - name: Invoices
+  - name: Refunds & credit notes
+  - name: Tax, coupons, currencies
+  - name: Webhooks
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        '200': { description: OK }
+
+  /v1/merchants:
+    post:
+      tags: [Merchants]
+      summary: Create a merchant (platform admin)
+      description: Returns the merchant and its first API key. The key is shown only once.
+      security:
+        - AdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MerchantInput' }
+            example:
+              name: Acme Store
+              country: IN
+              state_code: MH
+              gstin: 27AAPFU0939F1ZV
+              base_currency: INR
+              tax_mode: gst
+              fiscal_year_start_month: 4
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant: { $ref: '#/components/schemas/Merchant' }
+                  api_key: { type: string, example: bk_3q2-7wEX... }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /v1/merchant:
+    get:
+      tags: [Merchants]
+      summary: Get the authenticated merchant
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Merchant' } } } }
+    patch:
+      tags: [Merchants]
+      summary: Update merchant settings
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MerchantInput' } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Merchant' } } } }
+
+  /v1/api-keys:
+    get:
+      tags: [Merchants]
+      summary: List API keys (prefixes only)
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Merchants]
+      summary: Create an additional API key
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { label: { type: string } } }
+      responses:
+        '201': { description: Created. The full key is returned once. }
+  /v1/api-keys/{id}:
+    delete:
+      tags: [Merchants]
+      summary: Revoke an API key
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Revoked }
+
+  /v1/invoices:
+    post:
+      tags: [Invoices]
+      summary: Create an invoice
+      description: |
+        Assigns the next invoice number, calculates discounts and tax, and emits `invoice.created`
+        (plus `invoice.paid` when `payment` is included or the total is zero).
+
+        Tax rate per line, in order of precedence: `tax_rate`, `tax_rate_id`, the merchant tax rate
+        mapped to the line's `hsn_code`, the merchant's default tax rate, otherwise 0.
+
+        In GST mode the invoice is split into CGST + SGST when the place of supply equals the
+        merchant's state, and charged as IGST otherwise.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InvoiceInput' }
+            example:
+              external_id: order-1001
+              customer:
+                name: Priya Sharma
+                email: priya@example.com
+                state: KA
+                country: IN
+              line_items:
+                - description: Mechanical keyboard
+                  hsn_code: '847160'
+                  quantity: 1
+                  unit_amount: 450000
+                  discount_amount: 20000
+                  tax_rate: 18
+              coupon_code: WELCOME10
+              payment: { method: razorpay, reference: pay_Nx81 }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '200': { description: An invoice with this `external_id` already exists and is returned unchanged }
+        '400': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Invoices]
+      summary: List invoices
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/InvoiceStatus' } }
+        - { name: external_id, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Invoice' } }
+                  has_more: { type: boolean }
+
+  /v1/invoices/{id}:
+    get:
+      tags: [Invoices]
+      summary: Get an invoice with its line items
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/invoices/{id}/pdf:
+    get:
+      tags: [Invoices]
+      summary: Download the invoice as a PDF
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: PDF, content: { application/pdf: { schema: { type: string, format: binary } } } }
+
+  /v1/invoices/{id}/pay:
+    post:
+      tags: [Invoices]
+      summary: Record a payment
+      description: Omit `amount` to pay the full amount due. Emits `invoice.paid` when the invoice becomes fully paid.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: integer, minimum: 1 }
+                method: { type: string }
+                reference: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /v1/invoices/{id}/void:
+    post:
+      tags: [Invoices]
+      summary: Void an unpaid invoice
+      description: The number is kept (no gaps in the sequence). Invoices with payments must be refunded instead.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /v1/invoices/{id}/refunds:
+    post:
+      tags: [Refunds & credit notes]
+      summary: Issue a full or partial refund
+      description: |
+        Omit `amount` to refund everything that is still refundable. The refund is tax-inclusive;
+        tax is reversed proportionally and a credit note is issued automatically. Emits `refund.issued`.
+
+        This records the refund. Sending the money back is done by your payment gateway.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: integer, minimum: 1, description: Minor units. Omit for a full refund. }
+                reason: { type: string }
+                external_id: { type: string, description: Your refund id. Makes the call idempotent. }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Refund' } } } }
+        '200': { description: A refund with this `external_id` already exists and is returned unchanged }
+        '422': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Refunds & credit notes]
+      summary: List refunds for an invoice
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK }
+
+  /v1/invoices/{id}/credit-notes:
+    post:
+      tags: [Refunds & credit notes]
+      summary: Issue an adjustment credit note against the unpaid balance
+      description: Reduces the amount due. Omit `amount` to credit the whole outstanding balance.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: integer, minimum: 1 }
+                reason: { type: string }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/CreditNote' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /v1/credit-notes:
+    get:
+      tags: [Refunds & credit notes]
+      summary: List credit notes
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200': { description: OK }
+  /v1/credit-notes/{id}:
+    get:
+      tags: [Refunds & credit notes]
+      summary: Get a credit note
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CreditNote' } } } }
+
+  /v1/tax-rates:
+    get:
+      tags: ['Tax, coupons, currencies']
+      summary: List tax rates
+      responses:
+        '200': { description: OK }
+    post:
+      tags: ['Tax, coupons, currencies']
+      summary: Create a tax rate
+      description: Set `hsn_code` to apply the rate automatically to lines with that HSN/SAC code, or `is_default` to use it when nothing else matches.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, rate]
+              properties:
+                name: { type: string, example: GST 18% }
+                rate: { type: number, example: 18, description: Percent }
+                hsn_code: { type: string, example: '847160' }
+                is_default: { type: boolean }
+      responses:
+        '201': { description: Created }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/tax-rates/{id}:
+    delete:
+      tags: ['Tax, coupons, currencies']
+      summary: Deactivate a tax rate
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Deactivated }
+
+  /v1/coupons:
+    get:
+      tags: ['Tax, coupons, currencies']
+      summary: List coupons
+      responses:
+        '200': { description: OK }
+    post:
+      tags: ['Tax, coupons, currencies']
+      summary: Create a coupon
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, type, value]
+              properties:
+                code: { type: string, example: WELCOME10 }
+                type: { type: string, enum: [percent, fixed] }
+                value: { type: number, description: Percent, or minor units for fixed coupons }
+                currency: { type: string, description: Required for fixed coupons }
+                max_redemptions: { type: integer }
+                expires_at: { type: string, format: date-time }
+      responses:
+        '201': { description: Created }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/coupons/{id}:
+    delete:
+      tags: ['Tax, coupons, currencies']
+      summary: Deactivate a coupon
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Deactivated }
+
+  /v1/exchange-rates:
+    get:
+      tags: ['Tax, coupons, currencies']
+      summary: List exchange rates to the base currency
+      responses:
+        '200': { description: OK }
+    put:
+      tags: ['Tax, coupons, currencies']
+      summary: Set an exchange rate
+      description: 1 unit of `currency` = `rate` units of the merchant's base currency. Used when an invoice in that currency does not pass its own `exchange_rate`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currency, rate]
+              properties:
+                currency: { type: string, example: USD }
+                rate: { type: number, example: 83.5 }
+      responses:
+        '200': { description: OK }
+
+  /v1/webhook-endpoints:
+    get:
+      tags: [Webhooks]
+      summary: List webhook endpoints
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Webhooks]
+      summary: Register a webhook endpoint
+      description: Returns the signing `secret` once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url: { type: string, format: uri, example: 'https://shop.example.com/hooks/billing' }
+                events:
+                  type: array
+                  items: { type: string, enum: [invoice.created, invoice.paid, refund.issued, '*'] }
+      responses:
+        '201': { description: Created }
+        '400': { $ref: '#/components/responses/Error' }
+  /v1/webhook-endpoints/{id}:
+    delete:
+      tags: [Webhooks]
+      summary: Remove a webhook endpoint
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Removed }
+  /v1/webhook-deliveries:
+    get:
+      tags: [Webhooks]
+      summary: Delivery log
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, delivered, failed] } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200': { description: OK }
+
+components:
+  securitySchemes:
+    ApiKey:
+      type: http
+      scheme: bearer
+      description: Merchant API key
+    AdminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+    Offset: { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code: { type: string, example: validation_error }
+                  message: { type: string }
+                  details:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        field: { type: string }
+                        message: { type: string }
+  schemas:
+    Address:
+      type: object
+      properties:
+        line1: { type: string }
+        line2: { type: string }
+        city: { type: string }
+        state: { type: string }
+        postal_code: { type: string }
+        country: { type: string }
+    MerchantInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        legal_name: { type: string }
+        email: { type: string, format: email }
+        address: { $ref: '#/components/schemas/Address' }
+        country: { type: string, example: IN, description: 'ISO 3166 alpha-2. Default IN.' }
+        state_code: { type: string, example: MH, description: Compared with the place of supply for GST }
+        gstin: { type: string, example: 27AAPFU0939F1ZV }
+        tax_id: { type: string }
+        base_currency: { type: string, example: INR }
+        tax_mode: { type: string, enum: [none, standard, gst], default: standard }
+        prices_include_tax: { type: boolean, default: false }
+        require_hsn: { type: boolean, default: false, description: Reject GST invoice lines without an HSN/SAC code }
+        invoice_prefix: { type: string, default: INV, description: 1-4 uppercase letters or digits }
+        credit_note_prefix: { type: string, default: CN }
+        fiscal_year_start_month: { type: integer, minimum: 1, maximum: 12, default: 1, description: Numbering restarts each fiscal year. Use 4 for India. }
+    Merchant:
+      allOf:
+        - $ref: '#/components/schemas/MerchantInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            created_at: { type: string, format: date-time }
+    TaxComponent:
+      type: object
+      properties:
+        name: { type: string, example: CGST }
+        rate: { type: number, example: 9 }
+        amount: { type: integer, example: 38700 }
+    LineItemInput:
+      type: object
+      required: [description, unit_amount]
+      properties:
+        description: { type: string }
+        sku: { type: string }
+        hsn_code: { type: string, description: 'HSN/SAC code: 2, 4, 6 or 8 digits' }
+        quantity: { type: number, default: 1 }
+        unit_amount: { type: integer, description: Price per unit in minor units }
+        discount_amount: { type: integer, default: 0, description: Discount on the whole line, in minor units }
+        tax_rate: { type: number, description: Percent. Overrides configured tax rates. }
+        tax_rate_id: { type: string, format: uuid }
+    InvoiceInput:
+      type: object
+      required: [customer, line_items]
+      properties:
+        external_id: { type: string, description: Your order id. Makes creation idempotent. }
+        currency: { type: string, description: Defaults to the merchant's base currency }
+        exchange_rate: { type: number, description: 1 unit of the invoice currency in base currency. Falls back to the stored exchange rate. }
+        customer:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string }
+            email: { type: string, format: email }
+            phone: { type: string }
+            address: { $ref: '#/components/schemas/Address' }
+            gstin: { type: string }
+            state: { type: string, example: KA }
+            country: { type: string, example: IN }
+        place_of_supply: { type: string, description: State code. Defaults to the customer's state. }
+        tax_inclusive: { type: boolean, description: Defaults to the merchant's `prices_include_tax` }
+        line_items:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: { $ref: '#/components/schemas/LineItemInput' }
+        coupon_code: { type: string }
+        notes: { type: string }
+        due_date: { type: string, format: date }
+        metadata: { type: object, additionalProperties: true }
+        payment:
+          type: object
+          description: Record full payment at creation (order already paid at checkout)
+          properties:
+            method: { type: string }
+            reference: { type: string }
+    InvoiceStatus:
+      type: string
+      enum: [open, partially_paid, paid, credited, partially_refunded, refunded, void]
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        number: { type: string, example: INV-2627-000001 }
+        external_id: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/InvoiceStatus' }
+        currency: { type: string }
+        exchange_rate: { type: number }
+        customer: { type: object }
+        place_of_supply: { type: string, nullable: true }
+        intra_state: { type: boolean }
+        tax_inclusive: { type: boolean }
+        subtotal: { type: integer, description: Sum of line amounts before discounts }
+        discount_total: { type: integer }
+        coupon_code: { type: string, nullable: true }
+        coupon_discount: { type: integer }
+        tax_total: { type: integer }
+        tax_summary:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/TaxComponent'
+              - type: object
+                properties:
+                  taxable_amount: { type: integer }
+        total: { type: integer }
+        base_total: { type: integer, description: Total in the merchant's base currency }
+        amount_paid: { type: integer }
+        amount_credited: { type: integer }
+        amount_refunded: { type: integer }
+        amount_due: { type: integer }
+        notes: { type: string, nullable: true }
+        metadata: { type: object }
+        issued_at: { type: string, format: date-time }
+        due_date: { type: string, format: date, nullable: true }
+        paid_at: { type: string, format: date-time, nullable: true }
+        line_items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              position: { type: integer }
+              description: { type: string }
+              sku: { type: string, nullable: true }
+              hsn_code: { type: string, nullable: true }
+              quantity: { type: number }
+              unit_amount: { type: integer }
+              discount_amount: { type: integer, description: Line discount plus this line's share of the coupon }
+              taxable_amount: { type: integer }
+              tax_rate: { type: number }
+              tax_amount: { type: integer }
+              tax_components: { type: array, items: { $ref: '#/components/schemas/TaxComponent' } }
+              total: { type: integer }
+    CreditNote:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        invoice_id: { type: string, format: uuid }
+        number: { type: string, example: CN-2627-000001 }
+        type: { type: string, enum: [refund, adjustment] }
+        currency: { type: string }
+        amount: { type: integer }
+        taxable_amount: { type: integer }
+        tax_amount: { type: integer }
+        tax_components: { type: array, items: { $ref: '#/components/schemas/TaxComponent' } }
+        reason: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+    Refund:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        invoice_id: { type: string, format: uuid }
+        external_id: { type: string, nullable: true }
+        amount: { type: integer }
+        tax_amount: { type: integer }
+        reason: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        credit_note: { $ref: '#/components/schemas/CreditNote' }

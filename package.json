@@ -1,0 +1,23 @@
+{
+  "name": "billing-api",
+  "version": "0.1.0",
+  "description": "Multi-tenant billing API for ecommerce stores (invoices, GST, refunds, webhooks)",
+  "private": true,
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "migrate": "node src/migrate.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pdfkit": "^0.15.0",
+    "pg": "^8.12.0",
+    "swagger-ui-express": "^5.0.1",
+    "yaml": "^2.5.0",
+    "zod": "^3.23.8"
+  }
+}
